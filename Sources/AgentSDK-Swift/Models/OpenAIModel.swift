@@ -1,7 +1,8 @@
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import OpenAPIRuntime
-import AsyncHTTPClient
-import NIOCore
 
 /// Implementation of ModelInterface for OpenAI models
 public final class OpenAIModel: ModelInterface {
@@ -11,26 +12,22 @@ public final class OpenAIModel: ModelInterface {
     /// The API base URL
     private let apiBaseURL: URL
     
-    /// The HTTP client
-    private let httpClient: HTTPClient
+    /// The URL session used for network requests
+    private let urlSession: URLSession
     
     /// Creates a new OpenAI model
     /// - Parameters:
     ///   - apiKey: The API key for OpenAI
     ///   - apiBaseURL: The API base URL (defaults to OpenAI's API)
-    ///   - httpClient: Optional custom HTTP client
+    ///   - urlSession: Optional custom URL session
     public init(
         apiKey: String,
         apiBaseURL: URL = URL(string: "https://api.openai.com/v1")!,
-        httpClient: HTTPClient? = nil
+        urlSession: URLSession? = nil
     ) {
         self.apiKey = apiKey
         self.apiBaseURL = apiBaseURL
-        self.httpClient = httpClient ?? HTTPClient(eventLoopGroupProvider: .singleton)
-    }
-    
-    deinit {
-        try? httpClient.syncShutdown()
+        self.urlSession = urlSession ?? URLSession.shared
     }
     
     /// Gets a response from the model
@@ -44,30 +41,25 @@ public final class OpenAIModel: ModelInterface {
         let endpoint = "\(apiBaseURL)/chat/completions"
         
         // Create request
-        var request = HTTPClientRequest(url: endpoint)
-        request.method = .POST
-        request.headers.add(name: "Authorization", value: "Bearer \(apiKey)")
-        request.headers.add(name: "Content-Type", value: "application/json")
+        var request = createURLRequest(url: endpoint)
         
         // Add request body
         let bodyData = try JSONEncoder().encode(requestBody)
-        request.body = .bytes(bodyData)
+        request.httpBody = bodyData
         
         // Send request
-        let response = try await httpClient.execute(request, timeout: .seconds(60))
+        let (data, response) = try await urlSession.data(for: request, delegate: nil)
         
         // Check response status
-        guard response.status == .ok else {
-            let errorData = try await response.body.collect(upTo: 1024 * 1024)
-            let errorString = String(buffer: errorData)
-            throw OpenAIModelError.requestFailed(statusCode: Int(response.status.code), message: errorString)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            let errorString = String(data: data, encoding: .utf8) ?? "Unknown error"
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw OpenAIModelError.requestFailed(statusCode: statusCode, message: errorString)
         }
         
         // Parse response
-        let responseData = try await response.body.collect(upTo: 10 * 1024 * 1024)
-        let responseString = String(buffer: responseData)
-        let responseBytes = Data(responseString.utf8)
-        let openAIResponse = try JSONDecoder().decode(ChatCompletionResponse.self, from: responseBytes)
+        let openAIResponse = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
         
         return try convertResponse(openAIResponse)
     }
@@ -91,34 +83,30 @@ public final class OpenAIModel: ModelInterface {
         let endpoint = "\(apiBaseURL)/chat/completions"
         
         // Create request
-        var request = HTTPClientRequest(url: endpoint)
-        request.method = .POST
-        request.headers.add(name: "Authorization", value: "Bearer \(apiKey)")
-        request.headers.add(name: "Content-Type", value: "application/json")
+        var request = createURLRequest(url: endpoint)
         
         // Add request body
         let bodyData = try JSONEncoder().encode(requestBody)
-        request.body = .bytes(bodyData)
+        request.httpBody = bodyData
         
-        // Send request
-        let response = try await httpClient.execute(request, timeout: .seconds(600))
+        // Create URLSession task
+        let (data, response) = try await urlSession.data(for: request)
         
         // Check response status
-        guard response.status == .ok else {
-            let errorData = try await response.body.collect(upTo: 1024 * 1024)
-            let errorString = String(buffer: errorData)
-            throw OpenAIModelError.requestFailed(statusCode: Int(response.status.code), message: errorString)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            let errorString = String(data: data, encoding: .utf8) ?? "Unknown error"
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            throw OpenAIModelError.requestFailed(statusCode: statusCode, message: errorString)
         }
         
         // Process streamed response
         var contentBuffer = ""
         var toolCalls: [ModelResponse.ToolCall] = []
         
-        for try await chunk in response.body {
-            let chunkString = String(buffer: chunk)
-            
-            // Remove 'data: ' prefix and parse each line
-            let lines = chunkString.split(separator: "\n")
+        // Convert data to string and process line by line
+        if let responseStr = String(data: data, encoding: .utf8) {
+            let lines = responseStr.split(separator: "\n")
             
             for line in lines {
                 if line.hasPrefix("data: ") {
@@ -211,6 +199,18 @@ public final class OpenAIModel: ModelInterface {
             content: contentBuffer,
             toolCalls: toolCalls
         )
+    }
+    
+    /// Creates a URLRequest configured with the appropriate headers
+    /// - Parameter url: The URL string for the request
+    /// - Returns: A configured URLRequest
+    private func createURLRequest(url: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: url)!)
+        request.httpMethod = "POST"
+        request.addValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 600 // 10 minute timeout
+        return request
     }
     
     /// Creates a request body for the OpenAI API
