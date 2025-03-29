@@ -35,7 +35,12 @@ public final class OpenAIModel: ModelInterface {
     ///   - messages: The messages to send to the model
     ///   - settings: The settings to use for the model call
     /// - Returns: The model response
-    public func getResponse(messages: [Message], settings: ModelSettings) async throws -> ModelResponse {
+    // --- MODIFIED: Added agentTools parameter ---
+    public func getResponse(
+        messages: [Message],
+        settings: ModelSettings,
+        agentTools: [Tool<Any>] // Added to match protocol
+    ) async throws -> ModelResponse {
         let requestBody = try createRequestBody(messages: messages, settings: settings)
         
         let endpoint = "\(apiBaseURL)/chat/completions"
@@ -69,23 +74,20 @@ public final class OpenAIModel: ModelInterface {
     ///   - messages: The messages to send to the model
     ///   - settings: The settings to use for the model call
     ///   - callback: The callback to call for each streamed chunk
+    // --- MODIFIED: Added agentTools parameter ---
     public func getStreamedResponse(
         messages: [Message],
         settings: ModelSettings,
+        agentTools: [Tool<Any>], // Added to match protocol
         callback: @escaping (ModelStreamEvent) async -> Void
     ) async throws -> ModelResponse {
         let streamSettings = settings
-        
-        // Create request body with stream enabled
-        var requestBody = try createRequestBody(messages: messages, settings: streamSettings)
+        // Pass agentTools down
+        var requestBody = try createRequestBody(messages: messages, settings: streamSettings, agentTools: agentTools)
         requestBody.stream = true
-        
+
         let endpoint = "\(apiBaseURL)/chat/completions"
-        
-        // Create request
         var request = createURLRequest(url: endpoint)
-        
-        // Add request body
         let bodyData = try JSONEncoder().encode(requestBody)
         request.httpBody = bodyData
         
@@ -218,8 +220,12 @@ public final class OpenAIModel: ModelInterface {
     ///   - messages: The messages to send to the model
     ///   - settings: The settings to use for the model call
     /// - Returns: The request body
-    private func createRequestBody(messages: [Message], settings: ModelSettings) throws -> ChatCompletionRequest {
-        // Convert messages to OpenAI format
+    // --- MODIFIED: Added agentTools parameter ---
+    private func createRequestBody(
+        messages: [Message],
+        settings: ModelSettings,
+        agentTools: [Tool<Any>] = [] // Added parameter with default
+    ) throws -> ChatCompletionRequest {        // Convert messages to OpenAI format
         let openAIMessages = messages.map { message -> ChatMessage in
             let role = message.role.rawValue
             
@@ -237,7 +243,26 @@ public final class OpenAIModel: ModelInterface {
         }
         
         // Convert tools to OpenAI format
-        let tools: [OpenAITool]? = nil // Implement tool conversion if needed
+//        let tools: [OpenAITool]? = nil // Implement tool conversion if needed
+        
+        // --- MODIFIED SECTION START ---
+        // Convert tools to OpenAI format
+        let openAITools: [OpenAITool]? = agentTools.isEmpty ? nil : try agentTools.map { swiftTool in
+            // Call the helper to generate the JSON Schema dictionary
+            let jsonSchemaParameters = try convertParametersToJsonSchema(swiftTool.parameters)
+
+            // Create the FunctionDefinition using the generated schema
+            let functionDef = FunctionDefinition(
+                name: swiftTool.name,
+                description: swiftTool.description,
+                parameters: jsonSchemaParameters // Assign the schema dictionary
+            )
+            // Create the OpenAITool wrapper
+            return OpenAITool(type: "function", function: functionDef)
+        }
+        // Assign the potentially populated array
+        let tools = openAITools
+        // --- MODIFIED SECTION END ---
         
         // Create request body
         var request = ChatCompletionRequest(
@@ -371,26 +396,73 @@ public final class OpenAIModel: ModelInterface {
     }
     
     /// Function definition for the OpenAI chat completions API
+    // --- MODIFIED: FunctionDefinition with CORRECT Encodable conformance ---
     private struct FunctionDefinition: Encodable {
         let name: String
         let description: String
-        let parameters: [String: Any]
-        
-        enum CodingKeys: String, CodingKey {
-            case name, description, parameters
-        }
-        
+        let parameters: [String: Any] // The JSON Schema dictionary
+
+        // Provide custom encode(to:) to handle [String: Any]
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(name, forKey: .name)
             try container.encode(description, forKey: .description)
-            
-            // Encode parameters dictionary as a raw JSON string
-            let parametersData = try JSONSerialization.data(withJSONObject: parameters)
-            let parametersString = String(data: parametersData, encoding: .utf8) ?? "{}"
-            try container.encode(parametersString, forKey: .parameters)
+
+            // Manually encode the parameters dictionary
+            // We need to wrap it in a structure that JSONEncoder understands
+            // or encode it element by element. Let's use a wrapper struct.
+            try container.encode(JsonSchemaWrapper(parameters), forKey: .parameters)
+        }
+         // Keep CodingKeys if manually encoding specific keys
+         enum CodingKeys: String, CodingKey {
+             case name, description, parameters
+         }
+    }
+    // --- End Modification ---
+
+
+    // --- Helper for encoding [String: Any] JSON Schema ---
+    private struct JsonSchemaWrapper: Encodable {
+        let schema: [String: Any]
+
+        init(_ schema: [String: Any]) {
+            self.schema = schema
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(AnyCodable(schema)) // Use AnyCodable or similar technique
         }
     }
+    // --- We need an AnyCodable implementation or similar ---
+    // Add this struct (or use a library providing it)
+    private struct AnyCodable: Encodable {
+        let value: Any
+
+        init(_ value: Any) {
+            self.value = value
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            switch value {
+            case let string as String: try container.encode(string)
+            case let int as Int: try container.encode(int)
+            case let double as Double: try container.encode(double)
+            case let bool as Bool: try container.encode(bool)
+            case let array as [Any]: try container.encode(array.map { AnyCodable($0) }) // Recursive call for array elements
+            case let dictionary as [String: Any]: try container.encode(dictionary.mapValues { AnyCodable($0) }) // Recursive call for dictionary values
+            case is NSNull: try container.encodeNil()
+            default:
+                let context = EncodingError.Context(codingPath: container.codingPath, debugDescription: "AnyCodable value \(value) is not JSON encodable")
+                throw EncodingError.invalidValue(value, context)
+            }
+        }
+    }
+    // --- End AnyCodable ---
+
+
+
     
     /// Response from the OpenAI chat completions API
     private struct ChatCompletionResponse: Decodable {
@@ -474,6 +546,53 @@ public final class OpenAIModel: ModelInterface {
                 case name, arguments
             }
         }
+    }
+    
+    
+    /// Converts the SDK's Tool.Parameter array into a JSON Schema dictionary.
+    private func convertParametersToJsonSchema(_ params: [Tool<Any>.Parameter]) throws -> [String: Any] { // Use Any for Context placeholder if needed generically
+        // Basic JSON Schema structure
+        var schema: [String: Any] = [
+            "type": "object", // Root is always object for function params
+            "properties": [String: Any](),
+            "required": [String]()
+        ]
+        var properties = [String: Any]()
+        var requiredParams = [String]()
+
+        for param in params {
+            let paramSchema: [String: Any] = [
+                "type": param.type.jsonType, // Use the existing .jsonType mapping
+                "description": param.description
+            ]
+            // TODO: Add handling for other JSON Schema properties if needed
+            // (e.g., 'enum' based on ParameterType details, 'items' for arrays)
+            properties[param.name] = paramSchema
+            if param.required {
+                requiredParams.append(param.name)
+            }
+        }
+
+        if !properties.isEmpty {
+            schema["properties"] = properties
+        }
+        if !requiredParams.isEmpty {
+            schema["required"] = requiredParams
+        } else {
+            // OpenAPI requires 'required' to be present, even if empty, if properties exist
+            if !properties.isEmpty {
+                 schema["required"] = []
+            } else {
+                 // If no properties, remove 'required' entirely
+                 schema.removeValue(forKey: "required")
+            }
+        }
+        // If no properties, OpenAI expects an empty object for parameters, but
+        // our schema generation should handle this via the properties check.
+        // However, if the function truly takes NO arguments, the API might expect {} or omitting parameters entirely.
+        // Let's assume for now functions will have parameters if tools are defined with them.
+
+        return schema
     }
 }
 
